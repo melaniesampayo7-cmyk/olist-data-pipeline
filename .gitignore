@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TP Olist - datos y Airflow (no se suben al repo)
+raw/
+data/
+logs/
+config/
