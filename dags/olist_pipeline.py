@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 
 import pendulum
-from airflow.sdk import dag, task
+from airflow.sdk import dag, task, Variable 
 
 import csv
 
@@ -38,9 +38,11 @@ def olist_pipeline():
     @task
     def bronze_ingesta(**context):
         mes = context["data_interval_start"]
-        # Fecha de ingesta del lote original de Olist.
-        # Se mantiene fija para garantizar reprocesamientos reproducibles.
-        fecha_ingesta = pendulum.datetime(2026, 10, 27, tz="UTC")
+        fecha_ingesta = pendulum.from_format(
+            Variable.get("BRONZE_INGESTION_DATE"),
+            "YYYY-MM-DD",
+            tz="UTC"
+        )
 
         raw_dir = Path("/opt/airflow/raw")
         bronze_dir = Path(DATA_DIR) / "bronze"
