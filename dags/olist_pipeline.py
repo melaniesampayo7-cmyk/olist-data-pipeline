@@ -20,6 +20,8 @@ import pyarrow.parquet as pq
 
 import hashlib
 
+import duckdb
+
 DATA_DIR = "/opt/airflow/data"  # carpeta data/ del proyecto, montada en Docker
 
 default_args = {
@@ -967,8 +969,49 @@ def olist_pipeline():
 
 
     @task
+    
+    @task
     def gold_catalogo(gold: dict):
-        print(f"[Gold] Exponer en DuckDB la partición {gold['particion']}")
+
+        # Ubicación de los archivos Gold
+        ruta_gold = str(
+            Path(DATA_DIR) / "gold" / "ventas" / "**" / "*.parquet"
+        )
+
+        # Archivo donde guardaremos el catálogo DuckDB
+        ruta_catalogo = Path(DATA_DIR) / "gold" / "catalogo.duckdb"
+
+        # Crear conexión persistente
+        conn = duckdb.connect(str(ruta_catalogo))
+
+        try:
+            # Crear o actualizar la vista SQL
+            conn.execute(f"""
+                CREATE OR REPLACE VIEW ventas AS
+                SELECT *
+                FROM read_parquet(
+                    '{ruta_gold}',
+                    hive_partitioning=true
+                )
+            """)
+            # Consultar la cantidad total de filas
+            total = conn.execute(
+                "SELECT COUNT(*) FROM ventas"
+            ).fetchone()[0]
+
+            print(f"[Gold] Catálogo creado: {ruta_catalogo}")
+            print(f"[Gold] Vista SQL: ventas")
+            print(f"[Gold] Total de filas: {total}")
+
+        finally:
+            conn.close()
+
+        return {
+            "catalogo": str(ruta_catalogo),
+            "vista": "ventas",
+            "filas": total
+        }
+
 
     # Las tareas se pasan metadatos por XCom
     bronze = bronze_ingesta()
