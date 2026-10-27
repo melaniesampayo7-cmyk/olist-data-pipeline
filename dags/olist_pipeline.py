@@ -38,7 +38,9 @@ def olist_pipeline():
     @task
     def bronze_ingesta(**context):
         mes = context["data_interval_start"]
-        fecha_ingesta = pendulum.now("UTC")
+        # Fecha de ingesta del lote original de Olist.
+        # Se mantiene fija para garantizar reprocesamientos reproducibles.
+        fecha_ingesta = pendulum.datetime(2026, 10, 27, tz="UTC")
 
         raw_dir = Path("/opt/airflow/raw")
         bronze_dir = Path(DATA_DIR) / "bronze"
@@ -96,6 +98,59 @@ def olist_pipeline():
             "olist_sellers_dataset.csv",
             "pii_customers.csv",
         }
+        
+        columnas_obligatorias = {
+            "olist_customers_dataset.csv": {
+                "customer_id",
+                "customer_unique_id",
+                "customer_zip_code_prefix",
+            },
+            "olist_geolocation_dataset.csv": {
+                "geolocation_zip_code_prefix",
+                "geolocation_lat",
+                "geolocation_lng",
+            },
+            "olist_orders_dataset.csv": {
+                "order_id",
+                "customer_id",
+                "order_status",
+                "order_purchase_timestamp",
+            },
+            "olist_order_items_dataset.csv": {
+                "order_id",
+                "order_item_id",
+                "product_id",
+                "seller_id",
+                "price",
+                "freight_value",
+            },
+            "olist_order_payments_dataset.csv": {
+                "order_id",
+                "payment_sequential",
+                "payment_type",
+                "payment_value",
+            },
+            "olist_order_reviews_dataset.csv": {
+                "review_id",
+                "order_id",
+                "review_creation_date",
+            },
+            "olist_products_dataset.csv": {
+                "product_id",
+                "product_category_name",
+            },
+            "olist_sellers_dataset.csv": {
+                "seller_id",
+                "seller_zip_code_prefix",
+            },
+            "pii_customers.csv": {
+                "customer_id",
+                "customer_unique_id",
+                "full_name",
+                "email",
+                "phone_number",
+            },
+        }
 
         archivos = [Path(ruta) for ruta in bronze["archivos"]]
 
@@ -144,6 +199,16 @@ def olist_pipeline():
                 if len(encabezado) != len(primera_fila):
                     raise ValueError(
                         f"Columnas inconsistentes: {archivo.name}"
+                    )
+                
+                columnas_presentes = set(encabezado)
+                requeridas = columnas_obligatorias[archivo.name]
+                faltantes_columnas = requeridas - columnas_presentes
+
+                if faltantes_columnas:
+                    raise ValueError(
+                        f"Faltan columnas obligatorias en "
+                        f"{archivo.name}: {sorted(faltantes_columnas)}"
                     )
 
             print(f"[Bronze] OK: {archivo.name}")
