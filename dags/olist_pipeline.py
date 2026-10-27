@@ -14,6 +14,12 @@ from airflow.sdk import dag, task, Variable
 
 import csv
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+import hashlib
+
 DATA_DIR = "/opt/airflow/data"  # carpeta data/ del proyecto, montada en Docker
 
 default_args = {
@@ -224,15 +230,511 @@ def olist_pipeline():
         }
 
 
+    
     @task
     def silver_limpieza(validacion: dict):
-        print(f"[Silver] Tipar, deduplicar y resolver nulos ({validacion['mes']})")
-        return {"silver_dir": f"{DATA_DIR}/silver", "filas": 0}
+        print(f"[Silver] Procesando mes {validacion['mes']}")
 
+        # Archivo de clientes de Bronze
+        bronze_dir = Path(validacion["bronze_dir"])
+
+        
+        fecha_ingesta = pendulum.from_format(
+            Variable.get("BRONZE_INGESTION_DATE"),
+            "YYYY-MM-DD",
+            tz="UTC"
+        )
+
+        archivo_clientes = (
+            bronze_dir
+            / "olist_customers_dataset"
+            / f"ingested_year={fecha_ingesta.year}"
+            / f"ingested_month={fecha_ingesta.month:02d}"
+            / "olist_customers_dataset.csv"
+        )
+
+        if not archivo_clientes.is_file():
+            raise FileNotFoundError(
+                f"No se encontró el archivo: {archivo_clientes}"
+            )
+
+
+        
+
+        # Leer CSV conservando el código postal como texto
+        df = pd.read_csv(
+            archivo_clientes,
+            dtype={"customer_zip_code_prefix": "string"}
+        )
+
+        filas_originales = len(df)
+
+        # Eliminar duplicados por identificador de cliente
+        df = df.drop_duplicates(
+            subset=["customer_id"],
+            keep="first"
+        ).copy()
+
+        # Guardar Silver en formato Parquet
+        silver_dir = (
+            Path(DATA_DIR)
+            / "silver"
+            / "olist_customers_dataset"
+        )
+
+        silver_dir.mkdir(parents=True, exist_ok=True)
+
+        destino = silver_dir / "customers.parquet"
+
+        tabla = pa.Table.from_pandas(
+            df,
+            preserve_index=False
+        )
+
+        pq.write_table(tabla, destino)
+
+        print(
+            f"[Silver] Clientes: {filas_originales} "
+            f"originales, {len(df)} finales"
+        )
+
+
+        # ======================================
+        # SILVER - PEDIDOS
+        # ======================================
+
+        archivo_orders = (
+            bronze_dir
+            / "olist_orders_dataset"
+            / f"ingested_year={fecha_ingesta.year}"
+            / f"ingested_month={fecha_ingesta.month:02d}"
+            / "olist_orders_dataset.csv"
+        )
+
+        if not archivo_orders.is_file():
+            raise FileNotFoundError(
+                f"No se encontró: {archivo_orders}"
+            )
+
+        df_orders = pd.read_csv(archivo_orders)
+        filas_orders_originales = len(df_orders)
+
+        # Eliminar registros sin identificadores
+        df_orders = df_orders.dropna(
+            subset=["order_id", "customer_id"]
+        )
+
+        # Convertir columnas temporales
+        columnas_fecha = [
+            "order_purchase_timestamp",
+            "order_approved_at",
+            "order_delivered_carrier_date",
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date",
+        ]
+
+        for columna in columnas_fecha:
+            df_orders[columna] = pd.to_datetime(
+                df_orders[columna],
+                errors="coerce"
+            )
+
+        # Deduplicación por pedido
+        df_orders = df_orders.drop_duplicates(
+            subset=["order_id"],
+            keep="first"
+        ).copy()
+
+        # Guardar como Parquet
+        silver_orders_dir = (
+            Path(DATA_DIR)
+            / "silver"
+            / "olist_orders_dataset"
+        )
+
+        silver_orders_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        destino_orders = (
+            silver_orders_dir / "orders.parquet"
+        )
+
+        tabla_orders = pa.Table.from_pandas(
+            df_orders,
+            preserve_index=False
+        )
+
+        pq.write_table(tabla_orders, destino_orders)
+
+        print(
+            f"[Silver] Pedidos: "
+            f"{filas_orders_originales} originales, "
+            f"{len(df_orders)} finales"
+        )
+
+
+        
+        # ======================================
+        # SILVER - ITEMS DE PEDIDOS
+        # ======================================
+
+        archivo_items = (
+            bronze_dir
+            / "olist_order_items_dataset"
+            / f"ingested_year={fecha_ingesta.year}"
+            / f"ingested_month={fecha_ingesta.month:02d}"
+            / "olist_order_items_dataset.csv"
+        )
+
+        if not archivo_items.is_file():
+            raise FileNotFoundError(
+                f"No se encontró: {archivo_items}"
+            )
+
+        df_items = pd.read_csv(archivo_items)
+        filas_items_originales = len(df_items)
+
+        # Eliminar registros sin identificadores
+        df_items = df_items.dropna(
+            subset=[
+                "order_id",
+                "order_item_id",
+                "product_id",
+                "seller_id"
+            ]
+        )
+
+        # Convertir fecha a datetime
+        df_items["shipping_limit_date"] = pd.to_datetime(
+            df_items["shipping_limit_date"],
+            errors="coerce"
+        )
+
+        # Garantizar tipos numéricos
+        for columna in ["price", "freight_value"]:
+            df_items[columna] = pd.to_numeric(
+                df_items[columna],
+                errors="coerce"
+            )
+
+        # Deduplicar usando clave compuesta
+        df_items = df_items.drop_duplicates(
+            subset=["order_id", "order_item_id"],
+            keep="first"
+        ).copy()
+
+        # Guardar Parquet
+        silver_items_dir = (
+            Path(DATA_DIR)
+            / "silver"
+            / "olist_order_items_dataset"
+        )
+
+        silver_items_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        destino_items = (
+            silver_items_dir / "order_items.parquet"
+        )
+
+        tabla_items = pa.Table.from_pandas(
+            df_items,
+            preserve_index=False
+        )
+
+        pq.write_table(tabla_items, destino_items)
+
+        print(
+            f"[Silver] Items: "
+            f"{filas_items_originales} originales, "
+            f"{len(df_items)} finales"
+        )
+
+
+        
+        # ======================================
+        # SILVER - PRODUCTOS
+        # ======================================
+
+        archivo_productos = (
+            bronze_dir
+            / "olist_products_dataset"
+            / f"ingested_year={fecha_ingesta.year}"
+            / f"ingested_month={fecha_ingesta.month:02d}"
+            / "olist_products_dataset.csv"
+        )
+
+        if not archivo_productos.is_file():
+            raise FileNotFoundError(
+                f"No se encontró: {archivo_productos}"
+            )
+
+        df_productos = pd.read_csv(archivo_productos)
+        filas_productos_originales = len(df_productos)
+
+        # Eliminar registros sin identificador
+        df_productos = df_productos.dropna(
+            subset=["product_id"]
+        )
+
+        # Deduplicar por producto
+        df_productos = df_productos.drop_duplicates(
+            subset=["product_id"],
+            keep="first"
+        ).copy()
+
+        # Completar categorías desconocidas
+        df_productos["product_category_name"] = (
+            df_productos["product_category_name"]
+            .fillna("desconocida")
+        )
+
+        # Corregir nombres de columnas
+        df_productos = df_productos.rename(
+            columns={
+                "product_name_lenght": "product_name_length",
+                "product_description_lenght": "product_description_length"
+            }
+        )
+
+        # Conservar los demás nulos sin inventar valores
+
+        # Guardar Parquet
+        silver_productos_dir = (
+            Path(DATA_DIR)
+            / "silver"
+            / "olist_products_dataset"
+        )
+
+        silver_productos_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        destino_productos = (
+            silver_productos_dir / "products.parquet"
+        )
+
+        tabla_productos = pa.Table.from_pandas(
+            df_productos,
+            preserve_index=False
+        )
+
+        pq.write_table(tabla_productos, destino_productos)
+
+        print(
+            f"[Silver] Productos: "
+            f"{filas_productos_originales} originales, "
+            f"{len(df_productos)} finales"
+        )
+
+
+        
+        # ======================================
+        # SILVER - PAGOS
+        # ======================================
+
+        archivo_pagos = (
+            bronze_dir
+            / "olist_order_payments_dataset"
+            / f"ingested_year={fecha_ingesta.year}"
+            / f"ingested_month={fecha_ingesta.month:02d}"
+            / "olist_order_payments_dataset.csv"
+        )
+
+        if not archivo_pagos.is_file():
+            raise FileNotFoundError(
+                f"No se encontró: {archivo_pagos}"
+            )
+
+        df_pagos = pd.read_csv(archivo_pagos)
+        filas_pagos_originales = len(df_pagos)
+
+        # Eliminar registros sin clave
+        df_pagos = df_pagos.dropna(
+            subset=["order_id", "payment_sequential"]
+        )
+
+        # Convertir tipos numéricos
+        df_pagos["payment_sequential"] = pd.to_numeric(
+            df_pagos["payment_sequential"],
+            errors="raise"
+        ).astype("int64")
+
+        df_pagos["payment_installments"] = pd.to_numeric(
+            df_pagos["payment_installments"],
+            errors="raise"
+        ).astype("int64")
+
+        df_pagos["payment_value"] = pd.to_numeric(
+            df_pagos["payment_value"],
+            errors="raise"
+        )
+
+        # Deduplicación por clave compuesta
+        df_pagos = df_pagos.drop_duplicates(
+            subset=["order_id", "payment_sequential"],
+            keep="first"
+        ).copy()
+
+        # Guardar Parquet
+        silver_pagos_dir = (
+            Path(DATA_DIR)
+            / "silver"
+            / "olist_order_payments_dataset"
+        )
+
+        silver_pagos_dir.mkdir(
+            parents=True, exist_ok=True
+        )
+
+        destino_pagos = silver_pagos_dir / "payments.parquet"
+
+        tabla_pagos = pa.Table.from_pandas(
+            df_pagos,
+            preserve_index=False
+        )
+
+        pq.write_table(tabla_pagos, destino_pagos)
+
+        print(
+            f"[Silver] Pagos: "
+            f"{filas_pagos_originales} originales, "
+            f"{len(df_pagos)} finales"
+        )
+
+
+
+        return {
+            "silver_dir": str(Path(DATA_DIR) / "silver"),
+            "mes": validacion["mes"],
+            "filas_clientes": len(df),
+            "filas_pedidos": len(df_orders),
+            "filas_items": len(df_items),
+            "filas_productos": len(df_productos),
+            "filas_pagos": len(df_pagos)
+        }
+
+
+    
     @task
     def silver_enmascaramiento_pii(validacion: dict):
-        print(f"[Silver] Hashear PII con salt ({validacion['mes']})")
-        return {"pii_dir": f"{DATA_DIR}/silver/pii_customers", "filas": 0}
+
+        print(f"[Silver PII] Procesando mes {validacion['mes']}")
+
+        # Recuperar salt desde Airflow
+        salt = Variable.get("PII_SALT")
+
+        # Identificar la partición de Bronze
+        fecha_ingesta = pendulum.from_format(
+            Variable.get("BRONZE_INGESTION_DATE"),
+            "YYYY-MM-DD",
+            tz="UTC"
+        )
+
+        archivo_pii = (
+            Path(validacion["bronze_dir"])
+            / "pii_customers"
+            / f"ingested_year={fecha_ingesta.year}"
+            / f"ingested_month={fecha_ingesta.month:02d}"
+            / "pii_customers.csv"
+        )
+
+        if not archivo_pii.is_file():
+            raise FileNotFoundError(
+                f"No se encontró: {archivo_pii}"
+            )
+
+        # Leer la tabla original
+        df_pii = pd.read_csv(
+            archivo_pii,
+            dtype="string"
+        )
+
+        # Verificar las columnas personales
+        columnas_pii = [
+            "full_name",
+            "email",
+            "phone_number"
+        ]
+
+        requeridas = ["customer_id"] + columnas_pii
+
+        faltantes = set(requeridas) - set(df_pii.columns)
+
+        if faltantes:
+            raise ValueError(
+                f"Columnas PII faltantes: {sorted(faltantes)}"
+            )
+
+        filas_originales = len(df_pii)
+
+        # Eliminar registros sin identificador
+        df_pii = df_pii.dropna(
+            subset=["customer_id"]
+        )
+
+        # Deduplicar por cliente
+        df_pii = df_pii.drop_duplicates(
+            subset=["customer_id"],
+            keep="first"
+        ).copy()
+
+        # Hash SHA-256 con salt
+        def generar_hash(valor):
+            if pd.isna(valor):
+                return None
+
+            contenido = f"{salt}:{str(valor).strip().lower()}"
+
+            return hashlib.sha256(
+                contenido.encode("utf-8")
+            ).hexdigest()
+
+        # Reemplazar PII por hashes
+        for columna in columnas_pii:
+            df_pii[f"{columna}_hash"] = (
+                df_pii[columna].apply(generar_hash)
+            )
+
+        # Eliminar las columnas originales
+        df_pii = df_pii.drop(columns=columnas_pii)
+
+        # Guardar en Parquet
+        pii_dir = (
+            Path(DATA_DIR)
+            / "silver"
+            / "pii_customers"
+        )
+
+        pii_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        destino = pii_dir / "pii_customers.parquet"
+
+        tabla = pa.Table.from_pandas(
+            df_pii,
+            preserve_index=False
+        )
+
+        pq.write_table(tabla, destino)
+
+        print(
+            f"[Silver PII] {filas_originales} originales, "
+            f"{len(df_pii)} finales"
+        )
+
+        return {
+            "pii_dir": str(pii_dir),
+            "filas": len(df_pii)
+        }
+
 
     @task
     def gold_particiones(silver: dict, pii: dict, **context):
