@@ -43,7 +43,21 @@ def olist_pipeline():
     
     @task
     def bronze_ingesta(**context):
-        mes = context["data_interval_start"]
+        
+        # Mes de negocio: permite ejecutar períodos históricos
+        configuracion = context["dag_run"].conf or {}
+
+        mes_configurado = configuracion.get("business_month")
+
+        if mes_configurado:
+            mes = pendulum.from_format(
+                mes_configurado,
+                "YYYY-MM",
+                tz="UTC"
+            )
+        else:
+            mes = context["data_interval_start"]
+
         fecha_ingesta = pendulum.from_format(
             Variable.get("BRONZE_INGESTION_DATE"),
             "YYYY-MM-DD",
@@ -738,10 +752,219 @@ def olist_pipeline():
 
     @task
     def gold_particiones(silver: dict, pii: dict, **context):
-        mes = context["data_interval_start"]
-        print(f"[Gold] Unir {silver['silver_dir']} y {pii['pii_dir']}")
-        print(f"[Gold] Escribir partición year={mes:%Y}/month={mes:%m}")
-        return {"particion": f"year={mes:%Y}/month={mes:%m}", "filas": 0}
+        
+        # Usar el mismo mes procesado desde Bronze/Silver
+        mes = pendulum.from_format(
+            silver["mes"],
+            "YYYY-MM",
+            tz="UTC"
+        )
+
+        
+        # ======================================
+        # GOLD - LECTURA DE TABLAS SILVER
+        # ======================================
+
+        silver_dir = Path(silver["silver_dir"])
+
+        df_orders = pd.read_parquet(
+            silver_dir / "olist_orders_dataset" / "orders.parquet"
+        )
+
+        df_items = pd.read_parquet(
+            silver_dir / "olist_order_items_dataset" / "order_items.parquet"
+        )
+
+        df_productos = pd.read_parquet(
+            silver_dir / "olist_products_dataset" / "products.parquet"
+        )
+
+        df_clientes = pd.read_parquet(
+            silver_dir / "olist_customers_dataset" / "customers.parquet"
+        )
+
+        df_pagos = pd.read_parquet(
+            silver_dir / "olist_order_payments_dataset" / "payments.parquet"
+        )
+
+        print("[Gold] Tablas Silver cargadas correctamente")
+        print(f"[Gold] Pedidos: {len(df_orders)}")
+        print(f"[Gold] Items: {len(df_items)}")
+        print(f"[Gold] Productos: {len(df_productos)}")
+        print(f"[Gold] Clientes: {len(df_clientes)}")
+        print(f"[Gold] Pagos: {len(df_pagos)}")
+
+
+        
+        # ======================================
+        # GOLD - FILTRADO POR MES DE NEGOCIO
+        # ======================================
+
+        inicio_mes = mes.start_of("month")
+        fin_mes = inicio_mes.add(months=1)
+
+        # Seleccionar pedidos del período solicitado
+        df_orders_mes = df_orders[
+            (df_orders["order_purchase_timestamp"] >= inicio_mes.naive())
+            & (df_orders["order_purchase_timestamp"] < fin_mes.naive())
+        ].copy()
+
+        print(
+            f"[Gold] Período: {inicio_mes:%Y-%m-%d} "
+            f"hasta {fin_mes:%Y-%m-%d} (exclusivo)"
+        )
+
+        print(
+            f"[Gold] Pedidos del mes {mes:%Y-%m}: "
+            f"{len(df_orders_mes)}"
+        )
+
+        
+        # ======================================
+        # GOLD - AGREGACION DE PAGOS POR PEDIDO
+        # ======================================
+
+        df_pagos_agrupados = (
+            df_pagos
+            .groupby("order_id", as_index=False)
+            .agg(
+                total_pagado=("payment_value", "sum"),
+                cantidad_pagos=("payment_sequential", "count")
+            )
+        )
+
+        # Verificar que quede una fila por pedido
+        duplicados = df_pagos_agrupados.duplicated(
+            subset=["order_id"]
+        ).sum()
+
+        if duplicados != 0:
+            raise ValueError(
+                "Existen pedidos duplicados en los pagos agrupados"
+            )
+
+        print(
+            f"[Gold] Pagos agrupados: "
+            f"{len(df_pagos_agrupados)} pedidos únicos"
+        )
+
+        
+        # ======================================
+        # GOLD - UNION DE TABLAS SILVER
+        # ======================================
+
+        # 1. Pedidos del mes + items
+        df_gold = df_orders_mes.merge(
+            df_items,
+            on="order_id",
+            how="inner",
+            validate="one_to_many"
+        )
+
+        # 2. Agregar información de productos
+        df_gold = df_gold.merge(
+            df_productos[
+                ["product_id", "product_category_name"]
+            ],
+            on="product_id",
+            how="left",
+            validate="many_to_one"
+        )
+
+        # 3. Agregar información de clientes
+        df_gold = df_gold.merge(
+            df_clientes[
+                ["customer_id", "customer_city", "customer_state"]
+            ],
+            on="customer_id",
+            how="left",
+            validate="many_to_one"
+        )
+
+        # 4. Agregar pagos agrupados por pedido
+        df_gold = df_gold.merge(
+            df_pagos_agrupados,
+            on="order_id",
+            how="left",
+            validate="many_to_one"
+        )
+
+        # Verificar la clave única de cada item
+        duplicados = df_gold.duplicated(
+            ["order_id", "order_item_id"]
+        ).sum()
+
+        if duplicados:
+            raise ValueError(
+                f"Gold tiene {duplicados} items duplicados"
+            )
+
+        print(f"[Gold] Filas después de uniones: {len(df_gold)}")
+        print(f"[Gold] Pedidos únicos: {df_gold['order_id'].nunique()}")
+        print(f"[Gold] Duplicados de items: {duplicados}")
+
+        
+        # ======================================
+        # GOLD - SELECCION DE COLUMNAS
+        # ======================================
+
+        columnas_gold = [
+            "order_id",
+            "order_item_id",
+            "order_purchase_timestamp",
+            "order_status",
+            "customer_id",
+            "customer_city",
+            "customer_state",
+            "product_id",
+            "product_category_name",
+            "seller_id",
+            "price",
+            "freight_value",
+            "total_pagado",
+            "cantidad_pagos"
+        ]
+
+        df_gold = df_gold[columnas_gold].copy()
+
+        print(
+            f"[Gold] Tabla final: "
+            f"{len(df_gold)} filas y {len(df_gold.columns)} columnas"
+        )
+
+
+        
+        # ======================================
+        # GOLD - ESCRITURA PARQUET PARTICIONADO
+        # ======================================
+
+        particion = (
+            Path(DATA_DIR)
+            / "gold"
+            / "ventas"
+            / f"year={mes:%Y}"
+            / f"month={mes:%m}"
+        )
+
+        particion.mkdir(parents=True, exist_ok=True)
+
+        archivo_gold = particion / "ventas.parquet"
+
+        # Sobrescribir la partición del mes procesado
+        pq.write_table(
+            pa.Table.from_pandas(df_gold, preserve_index=False),
+            archivo_gold
+        )
+
+        print(f"[Gold] Archivo generado: {archivo_gold}")
+        print(f"[Gold] Filas guardadas: {len(df_gold)}")
+
+        return {
+            "particion": f"year={mes:%Y}/month={mes:%m}",
+            "archivo": str(archivo_gold),
+            "filas": len(df_gold)
+        }
+
 
     @task
     def gold_catalogo(gold: dict):
