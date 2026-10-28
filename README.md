@@ -4,7 +4,7 @@ Pipeline de datos end-to-end con **arquitectura Medallion** (Bronze → Silver �
 
 El pipeline es parametrizado, determinístico e idempotente: cada ejecución procesa un mes de negocio y puede re-ejecutarse sin duplicar datos.
 
-**Integrantes:** _completar_
+**Integrantes:** Baéz, Echeverría, Nogueira, Sampayo y Uesato
 
 ---
 
@@ -18,12 +18,12 @@ El pipeline es parametrizado, determinístico e idempotente: cada ejecución pro
 6. [Capa Silver: decisiones de calidad de datos](#capa-silver-decisiones-de-calidad-de-datos)
 7. [Gobernanza de PII](#gobernanza-de-pii)
 8. [Capa Gold: modelo y particionamiento](#capa-gold-modelo-y-particionamiento)
-9. [Catálogo DuckDB](#catálogo-duckdb)
+9. [Catálogo DuckDB y consultas SQL](#catálogo-duckdb-y-consultas-sql)
 10. [Idempotencia](#idempotencia)
 11. [Validación de partition pruning (FinOps)](#validación-de-partition-pruning-finops)
 12. [Flujo de trabajo con Git](#flujo-de-trabajo-con-git)
 13. [Migración a AWS](#migración-a-aws)
-14. [Pendientes y limitaciones conocidas](#pendientes-y-limitaciones-conocidas)
+14. [Mejoras futuras](#mejoras-futuras)
 
 ---
 
@@ -62,19 +62,23 @@ DuckDB   data/gold/catalogo.duckdb  →  vista `ventas`
 ```
 olist-data-pipeline/
 ├── dags/
-│   └── olist_pipeline.py          # DAG con las 6 tareas del pipeline
+│   └── olist_pipeline.py            # DAG con las 6 tareas del pipeline
 ├── scripts/
-│   ├── generador_pii_sintetica.py # genera raw/pii_customers.csv
-│   ├── finops_validation.py       # EXPLAIN ANALYZE: escaneo completo vs. con pruning
-│   └── finops_resultados.txt      # salida de la validación
+│   ├── generador_pii_sintetica.py   # genera raw/pii_customers.csv
+│   ├── backfill_historico.ps1       # dispara el DAG para cada mes del histórico
+│   ├── finops_validation.py         # EXPLAIN ANALYZE: escaneo completo vs. con pruning
+│   ├── finops_resultados.txt        # salida de la validación
+│   └── ejecutar_sql.py              # ejecuta sql/consultas_gold.sql con DuckDB
 ├── sql/
+│   └── consultas_gold.sql           # vista, validación FinOps y consultas de análisis
 ├── docs/
-│   └── 01_eda_hallazgos.md        # hallazgos del análisis exploratorio
+│   ├── 01_eda_hallazgos.md          # hallazgos del análisis exploratorio
+│   └── resultados_consultas_sql.txt # salida de las consultas SQL
 ├── notebooks/
-│   └── 01_eda_olist.ipynb         # EDA
-├── Dockerfile                     # imagen de Airflow con las librerías del proyecto
+│   └── 01_eda_olist.ipynb           # EDA
+├── Dockerfile                       # imagen de Airflow con las librerías del proyecto
 ├── docker-compose.yaml
-├── requirements.txt               # pandas, pyarrow, duckdb, faker
+├── requirements.txt                 # pandas, pyarrow, duckdb, faker
 └── .gitignore
 ```
 
@@ -86,7 +90,7 @@ No se versionan (están en `.gitignore`): `raw/` (CSV fuente y PII sintética), 
 
 ### 1. Requisitos
 
-Git, Docker Desktop (con al menos 4 GB de memoria disponibles), Python 3.12 en la máquina local (solo para generar la PII sintética y correr el notebook) y una cuenta de Kaggle.
+Git, Docker Desktop (con al menos 4 GB de memoria disponibles), Python 3.12 en la máquina local (para generar la PII sintética, correr el notebook y ejecutar las consultas SQL sin Airflow) y una cuenta de Kaggle.
 
 ### 2. Clonar el repositorio
 
@@ -100,7 +104,7 @@ git checkout develop
 
 1. Descargar el dataset de Kaggle y copiar los CSV **directamente** en `raw/` (sin subcarpetas). El pipeline ingiere estas 8 tablas:
    `olist_customers_dataset.csv`, `olist_geolocation_dataset.csv`, `olist_orders_dataset.csv`, `olist_order_items_dataset.csv`, `olist_order_payments_dataset.csv`, `olist_order_reviews_dataset.csv`, `olist_products_dataset.csv` y `olist_sellers_dataset.csv`.
-2. **`product_category_name_translation.csv` no debe quedar en `raw/`**, porque la validación de Bronze espera exactamente 9 archivos (ver [Pendientes](#pendientes-y-limitaciones-conocidas)). Se puede mover a una subcarpeta, por ejemplo `raw/no_ingerir/`.
+2. **`product_category_name_translation.csv` no debe quedar en `raw/`**, porque la validación de Bronze espera exactamente 9 archivos (ver [Mejoras futuras](#mejoras-futuras)). Se puede mover a una subcarpeta, por ejemplo `raw/no_ingerir/`.
 3. Generar la tabla sintética de PII:
    ```bash
    pip install pandas faker
@@ -156,6 +160,21 @@ docker compose exec airflow-scheduler airflow variables set BRONZE_INGESTION_DAT
 {"business_month": "2017-01"}
 ```
 
+**Todo el histórico:** `scripts/backfill_historico.ps1` dispara una ejecución del DAG por cada mes con pedidos (25 meses, de septiembre de 2016 a octubre de 2018), pasando `business_month` en la configuración. Es equivalente a lanzar cada mes desde **Trigger**, pero automatizado. El script solo envía las solicitudes: Airflow las ejecuta de a una (`max_active_runs=1`).
+
+```powershell
+.\scripts\backfill_historico.ps1
+```
+
+### 7. Consultar Gold con SQL (sin Airflow)
+
+Con la capa Gold generada en `data/gold/ventas/`, las consultas de `sql/consultas_gold.sql` se pueden ejecutar localmente con DuckDB, sin Docker:
+
+```bash
+pip install duckdb
+python scripts/ejecutar_sql.py
+```
+
 ---
 
 ## El DAG
@@ -173,7 +192,7 @@ bronze_ingesta >> bronze_validacion >> [silver_limpieza, silver_enmascaramiento_
 | `gold_particiones` | Une las tablas Silver, filtra el mes de negocio y escribe la partición `year=/month=` |
 | `gold_catalogo` | Actualiza la vista `ventas` de DuckDB sobre todas las particiones |
 
-**Configuración:** `schedule="@monthly"`, `start_date` septiembre de 2016, `catchup=False` (los meses históricos se procesan por backfill o ejecución manual), `max_active_runs=1` (dos ejecuciones nunca escriben las mismas carpetas a la vez) y 2 reintentos por tarea con 1 minuto de espera.
+**Configuración:** `schedule="@monthly"`, `start_date` septiembre de 2016, `catchup=False` (los meses históricos se procesan con ejecuciones manuales, no automáticamente al activar el DAG), `max_active_runs=1` (dos ejecuciones nunca escriben las mismas carpetas a la vez) y 2 reintentos por tarea con 1 minuto de espera.
 
 **Decisiones de diseño:**
 
@@ -182,7 +201,12 @@ bronze_ingesta >> bronze_validacion >> [silver_limpieza, silver_enmascaramiento_
 - **XCom solo para metadatos.** Las tareas se pasan rutas, meses y cantidades de filas, nunca tablas: los datos viajan por disco, porque XCom está pensado para valores chicos.
 - **Nombres `capa_acción`.** El recorrido Bronze → Silver → Gold se lee con solo mirar los nombres de las tareas.
 
-**Mes de negocio.** Cada ejecución procesa el mes que surge de `data_interval_start`. Para pruebas manuales, el parámetro opcional `business_month` (formato `YYYY-MM`) permite indicar un mes histórico. En Airflow 3, los schedules cron usan por defecto un *timetable* donde `data_interval_start` y `data_interval_end` coinciden; por eso el pipeline toma el mes de `data_interval_start` y calcula el fin del mes en el código, en lugar de filtrar entre ambas fechas.
+**Mes de negocio.** Cada ejecución procesa un único mes, que se determina así:
+
+1. Si la ejecución recibe `business_month` (formato `YYYY-MM`) en su configuración, se usa ese mes.
+2. Si no, se usa la fecha lógica de Airflow, `data_interval_start`, por lo que el DAG también funciona con el schedule mensual o con el backfill nativo de Airflow.
+
+Como Olist es un dataset histórico, el histórico completo se procesó con la primera opción, eligiendo explícitamente cada mes de negocio. En Airflow 3, los schedules cron usan por defecto un *timetable* donde `data_interval_start` y `data_interval_end` coinciden; por eso el pipeline toma el inicio del mes y calcula el fin en el código, en lugar de filtrar entre ambas fechas.
 
 ---
 
@@ -237,7 +261,7 @@ Cada tabla se deduplica según su propia clave natural, conservando la primera a
 | order_payments | `order_id` + `payment_sequential` |
 | pii_customers | `customer_id` |
 
-En estas tablas no se encontraron duplicados por clave: la deduplicación funciona como control, para que una re-carga del origen no duplique entidades. El EDA encontró duplicados reales en `geolocation` (261.831 filas duplicadas completas, 26 %), una tabla que hoy no se procesa en Silver (ver [Pendientes](#pendientes-y-limitaciones-conocidas)).
+En estas tablas no se encontraron duplicados por clave: la deduplicación funciona como control, para que una re-carga del origen no duplique entidades. El EDA encontró duplicados reales en `geolocation` (261.831 filas duplicadas completas, 26 %), una tabla que hoy no se procesa en Silver (ver [Mejoras futuras](#mejoras-futuras)).
 
 En `order_reviews`, el EDA mostró que un `review_id` repetido **no** es un duplicado: es una misma encuesta asociada a pedidos distintos. La clave correcta es (`review_id`, `order_id`), sin duplicados reales.
 
@@ -302,9 +326,14 @@ Los pagos se agregan **antes** del join porque un pedido puede tener varios pago
 
 **Partición:** `data/gold/ventas/year=YYYY/month=MM/ventas.parquet`, según la fecha de compra (`order_purchase_timestamp`). Se eligió esa clave porque es la fecha de negocio central, existe en todos los pedidos (no tiene nulos, a diferencia de las fechas de entrega) y responde al patrón de consulta más frecuente: analizar períodos. Particionar por estado o categoría generaría muchas carpetas desparejas y no ayudaría a las consultas temporales.
 
+**Resultado del histórico:** 25 particiones mensuales, de septiembre de 2016 a octubre de 2018, con **112.650 filas** en total, exactamente la cantidad de ítems de Olist. Dos casos particulares:
+
+- **Noviembre de 2016** no tiene pedidos, así que no se procesó y no tiene partición.
+- **Octubre de 2018** tiene partición, pero vacía: sus 4 pedidos están cancelados y no tienen ítems, por lo que no generan filas al unir pedidos con ítems.
+
 ---
 
-## Catálogo DuckDB
+## Catálogo DuckDB y consultas SQL
 
 `gold_catalogo` crea o actualiza el archivo `data/gold/catalogo.duckdb` con una vista:
 
@@ -314,6 +343,14 @@ SELECT * FROM read_parquet('/opt/airflow/data/gold/ventas/**/*.parquet', hive_pa
 ```
 
 La vista no copia datos: guarda cómo leer los Parquet. Con `hive_partitioning=true`, DuckDB reconoce las carpetas `year=` y `month=` como columnas, y nuevas particiones quedan disponibles sin cambiar la vista.
+
+**Consultas SQL.** `sql/consultas_gold.sql` reúne las consultas del proyecto sobre Gold: la vista, el control de filas por partición, las dos consultas de la validación FinOps y tres consultas de análisis. Usa rutas relativas a la raíz del repositorio, para poder ejecutarlas fuera del contenedor con `python scripts/ejecutar_sql.py`. La salida completa está en `docs/resultados_consultas_sql.txt`.
+
+Algunos resultados de las consultas de análisis:
+
+- **Crecimiento:** las ventas pasan de unos pocos cientos de pedidos por mes en 2016 a más de 6.000 por mes en 2018, con una facturación mensual superior a 1 millón de reales.
+- **Volumen no es lo mismo que facturación:** `cama_mesa_banho` es la categoría con más ítems vendidos, pero queda tercera en facturación, por debajo de `beleza_saude` y `relogios_presentes`, que venden productos más caros.
+- **Concentración geográfica:** San Pablo concentra más del 40 % de los pedidos, pero tiene el ticket promedio más bajo; los estados más alejados, como Acre o Alagoas, tienen tickets más altos, probablemente por el costo del flete.
 
 ---
 
@@ -351,22 +388,25 @@ Como el script lee la ruta del contenedor, se ejecuta dentro de él. Desde Power
 Get-Content scripts/finops_validation.py | docker compose exec -T airflow-scheduler python -
 ```
 
-**Resultados** (salida completa en `scripts/finops_resultados.txt`):
+**Resultados** sobre el histórico completo (salida completa en `scripts/finops_resultados.txt`):
 
-| Métrica | Escaneo completo | Con pruning |
+| Métrica | Escaneo completo | Con pruning (enero 2017) |
 |---|---|---|
-| Archivos Parquet leídos | 2 | 1 |
-| Filas procesadas | 2.906 | 955 |
-| Datos leídos | 32,7 kB | 16,3 kB |
+| Archivos Parquet leídos | 25 | 1 |
+| Filas leídas | 112.650 | 955 |
+| Datos leídos | 379,1 kB | 26,0 kB |
 
-> Estos resultados corresponden a Gold con dos meses procesados (enero y febrero de 2017).
+El escaneo con filtro leyó **96 % menos archivos**, **99,2 % menos filas** y **93 % menos datos**. En el plan de ejecución, la evidencia está en el nodo *Table Scan*: `File Filters: (year = 2017)(CAST(month AS INTEGER) = 1)` y `Scanning Files: 1/25`, es decir, DuckDB aplicó el filtro sobre los nombres de las carpetas y descartó las otras 24 particiones sin abrirlas.
+
+Las mismas dos consultas están en `sql/consultas_gold.sql`; al ejecutarlas localmente con `scripts/ejecutar_sql.py` se reprodujeron los mismos resultados en otra máquina (salida en `docs/resultados_consultas_sql.txt`).
+
 ---
 
 ## Flujo de trabajo con Git
 
 - `main`: versión estable, protegida; solo se modifica por Pull Request con una aprobación.
 - `develop`: rama de integración.
-- `feature/...`: una rama por tarea (`feature/eda`, `feature/pii-sintetica`, `feature/gold-particiones`, `feature/duckdb-catalogo`, etc.), integrada a `develop` por Pull Request revisado por otra integrante.
+- `feature/...`: una rama por tarea (`feature/eda`, `feature/pii-sintetica`, `feature/gold-particiones`, `feature/duckdb-catalogo`, `feature/backfill-historico`, `feature/sql-consultas`, `feature/readme`, etc.), integrada a `develop` por Pull Request revisado por otra integrante.
 
 ---
 
@@ -395,4 +435,4 @@ Durante el análisis exploratorio se identificaron mejoras que quedaron fuera de
 - **Pedidos `delivered` con fechas faltantes** (14 sin aprobación, 2 sin despacho, 8 sin entrega): marcarlos con una columna de calidad, para excluirlos de los cálculos de tiempos de entrega.
 - **`product_category_name_translation`:** incorporarla al pipeline y completar a mano las 2 categorías sin traducción (`pc_gamer` y `portateis_cozinha_e_preparadores_de_alimentos`).
 - **Teléfonos de la PII:** normalizarlos a solo dígitos antes de hashear, porque llegan con formatos distintos (con y sin `+55`) y un mismo número escrito de dos formas daría hashes distintos.
-- **PII en Gold:** incorporar `email_hash` a la tabla analítica, para mostrar uniones por hash sin exponer el dato original. 
+- **PII en Gold:** incorporar `email_hash` a la tabla analítica, para mostrar uniones por hash sin exponer el dato original.
